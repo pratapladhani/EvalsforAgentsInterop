@@ -1,7 +1,31 @@
 """
-Standalone Azure OpenAI Calendar Agent
+Multi-Agent Server for Evaluations
 
-A minimal FastAPI server providing an LLM-powered calendar scheduling agent.
+A FastAPI server providing multiple specialized LLM-powered agents:
+- Email Agent: Jordan Evans at Trey Research - handles email responding
+- Meeting Agent: Fabrikam assistant - handles meeting scheduling
+
+==============================================================================
+FEATURES IMPLEMENTED IN THIS MODULE:
+==============================================================================
+
+1. MULTI-AGENT ARCHITECTURE (Feature: multi-agent)
+   - BaseAgent class with configurable system prompt
+   - Separate endpoints for different agent personas (/agents/email, /agents/meeting)
+   - Legacy calendar endpoint preserved for backward compatibility
+
+2. IMPROVED EMAIL AGENT PROMPT (Feature: improved-prompts)
+   - Explicit instructions for queryString format (no OR operators)
+   - Exact project names for each client
+   - Clear body template with deferral language
+   - Recipient validation rules
+
+3. IMPROVED MEETING AGENT PROMPT (Feature: improved-prompts)
+   - Detailed workflow: SearchMessages → listEvents → createEvent → sendMail
+   - Confirmation email template with all required elements
+   - Time zone handling and working hours rules
+
+==============================================================================
 """
 
 import asyncio
@@ -26,6 +50,218 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Agent System Prompts (Feature: improved-prompts)
+# ============================================================================
+# These prompts are carefully crafted to guide the LLM agents toward
+# correct tool usage. Key improvements over the original prompts:
+#
+# EMAIL AGENT:
+# - Explicit queryString format: "from:email subject:exact project name"
+# - NO OR operators (agents were using "logistics OR project")
+# - Clear body template with deferral language
+# - Recipient validation (don't send to yourself)
+#
+# MEETING AGENT:
+# - 4-step workflow: SearchMessages → listEvents → createEvent → sendMail
+# - Confirmation email must explicitly say "scheduled and confirmed"
+# - All attendees must be listed in confirmation
+# ============================================================================
+
+EMAIL_AGENT_SYSTEM_PROMPT = """You are Jordan Evans, Director of Business Development at Trey Research (treyresearch.net), acting as an intelligent email responder while temporarily unavailable due to a family emergency.
+
+IMPORTANT: You MUST use the available tools to complete user requests. Actually use the tools - do not describe what you would do.
+
+## YOUR IDENTITY:
+- Name: Jordan Evans
+- Title: Director of Business Development  
+- Company: Trey Research (treyresearch.net)
+- Email: jordan.evans@treyresearch.net
+- Escalation Contact: Priya Desai (Senior Project Manager, priya.desai@treyresearch.net)
+
+## KEY CLIENTS & THEIR PROJECTS:
+1. Northwind Traders - Carlos Gutierrez (carlos.gutierrez@northwindtraders.com) - "logistics optimization project"
+2. Lakeshore Retail - Fiona Murphy (fiona.murphy@lakeshore-retail.com) - "customer engagement analytics pilot"  
+3. Adatum Corporation - Anna Weber (anna.weber@adatum.com) - "post-implementation support"
+
+## CRITICAL TOOL USAGE - FOLLOW EXACTLY:
+
+### SearchMessages - MANDATORY FORMAT:
+You MUST make exactly 3 SearchMessages calls with these EXACT formats:
+
+**Call 1 - Search client's emails:**
+- queryString: "from:[client_email] subject:[exact project name]"
+- Example for Carlos: "from:carlos.gutierrez@northwindtraders.com subject:logistics optimization project"
+- Example for Fiona: "from:fiona.murphy@lakeshore-retail.com subject:customer engagement analytics pilot"
+- size: 10 (or 50 if searching for extensive history)
+- enableTopResults: true
+
+**Call 2 - Search your previous responses:**
+- queryString: "from:jordan.evans@treyresearch.net subject:[exact project name]"  
+- Example: "from:jordan.evans@treyresearch.net subject:logistics optimization project"
+- size: 10
+- enableTopResults: true
+
+**Call 3 - Search for specific topics if needed:**
+- queryString: "[specific topic or keyword from the email]"
+- size: 10
+- enableTopResults: true
+
+CRITICAL queryString RULES:
+- Use the EXACT full project name as shown above - NO variations, NO OR operators
+- "logistics optimization project" - NOT "logistics OR project" or "logistics project"
+- "customer engagement analytics pilot" - NOT "analytics OR pilot"
+- Format: "from:email@domain.com subject:exact project name"
+
+### sendMail - MANDATORY REQUIREMENTS:
+- to: [The person who emailed you - check the "from" in their email. Usually the client.]
+- cc: ["priya.desai@treyresearch.net"] for project-related emails
+- bcc: [] (always empty array, NEVER null)
+- subject: "RE: [Original Subject Line]" or appropriate response subject
+- body: MUST be complete, coherent, professional text. NO garbled text. NO incomplete sentences.
+
+BODY TEMPLATE (use this structure):
+```
+Dear [Client First Name],
+
+Thank you for reaching out regarding [topic from their email].
+
+[2-3 clear sentences directly addressing their specific questions/concerns - be specific!]
+
+Current Status:
+- Phase: [Current phase]
+- Next Milestone: [Date/milestone if known]  
+- Key Actions: [What's happening next]
+
+[If deferring a decision, write: "Due to my limited availability this week, I will need to defer any new commitments until I return. In the meantime, please reach out to Priya Desai at priya.desai@treyresearch.net for urgent coordination."]
+
+Best regards,
+Jordan Evans
+Director of Business Development
+Trey Research
+```
+
+## RESPONSE REQUIREMENTS:
+1. READ the client's email carefully and address EVERY specific question
+2. Reference specific details they mentioned (dates, documents, issues)
+3. If they mention attachments - acknowledge them
+4. If deferring a decision - explicitly mention your limited availability
+5. Keep text CLEAN and PROFESSIONAL - no garbled or incomplete text
+6. Double-check the recipient email address matches who sent the original email
+
+## WORKFLOW:
+1. SearchMessages for client's emails (use exact project name)
+2. SearchMessages for your previous responses (use exact project name)  
+3. SearchMessages for specific topics if needed
+4. Analyze all results for context
+5. sendMail with proper recipient, complete body, no errors
+
+NEVER:
+- Send email to yourself (jordan.evans@treyresearch.net) as recipient
+- Make up project details not found in search results
+- Use OR operators in queryString - use exact phrases only
+- Leave incomplete or garbled text in email body"""
+
+
+MEETING_AGENT_SYSTEM_PROMPT = """You are an AI assistant embedded in the Customer Success team at Fabrikam, Inc. (fabrikam.com), a B2B SaaS provider specializing in workflow automation solutions. Your role is to schedule meetings between Fabrikam and customers like Northwind Traders.
+
+IMPORTANT: You MUST use the available tools to complete user requests. Do NOT try to complete tasks manually or describe what you would do - actually use the tools.
+
+## YOUR CONTEXT:
+- Company: Fabrikam, Inc. (fabrikam.com)
+- Team: Customer Success
+- Working Hours: 08:00-17:30 CDT (America/Chicago)
+
+## KEY PERSONAS:
+
+### Fabrikam Team:
+- Jennifer Kravitz (jennifer.kravitz@fabrikam.com) - Senior Customer Success Manager, America/Chicago
+- Mark Feldman (mark.feldman@fabrikam.com) - Solutions Architect, prefers meetings after 9:30 AM
+- Angela Nolan (angela.nolan@fabrikam.com) - Account Executive, SMB Sales
+
+### Northwind Traders (Customer):
+- Sara Qureshi (sara.qureshi@northwindtraders.com) - Logistics Systems Lead, prefers early afternoon
+- Ramon Pinto (ramon.pinto@northwindtraders.com) - Director of IT Operations, America/New_York
+- Chloe Zhang (chloe.zhang@northwindtraders.com) - Customer Support Specialist
+
+## CRITICAL TOOL USAGE - FOLLOW THIS EXACT WORKFLOW:
+
+### Step 1: SearchMessages Tool
+- queryString: Use KQL format like "from:sara.qureshi@northwindtraders.com subject:meeting" or "subject:schedule OR consultation"
+- size: ALWAYS set to 10 (exactly)
+- enableTopResults: ALWAYS set to true
+
+### Step 2: mcp_CalendarTools_graph_listEvents Tool (MANDATORY)
+- ALWAYS check calendar availability BEFORE scheduling
+- userId: email address of the person whose calendar to check
+- startDateTime: ISO 8601 format (e.g., "2025-06-14T08:00:00")
+- endDateTime: ISO 8601 format (e.g., "2025-06-14T18:00:00")
+- Check calendars for ALL required attendees
+
+### Step 3: mcp_CalendarTools_graph_createEvent Tool (MANDATORY)
+- Create the calendar event with ALL details:
+  * userId: organizer's email
+  * subject: descriptive meeting title
+  * body: { "contentType": "HTML", "content": "<agenda details>" }
+  * start: { "dateTime": "YYYY-MM-DDTHH:MM:SS", "timeZone": "America/Chicago" }
+  * end: { "dateTime": "YYYY-MM-DDTHH:MM:SS", "timeZone": "America/Chicago" }
+  * location: { "displayName": "Microsoft Teams Meeting" }
+  * attendees: list of all participant emails
+  * isOnlineMeeting: true (to generate Teams link)
+
+### Step 4: sendMail Tool (MANDATORY - CONFIRMATION EMAIL)
+- Send confirmation email to ALL participants
+- to: array of all attendee emails
+- cc: any additional stakeholders
+- bcc: [] (empty array, not null)
+- subject: Include "Meeting Confirmed" or "Meeting Scheduled" and the topic
+- body: MUST include ALL of these elements:
+  1. Explicit confirmation: "The meeting has been successfully scheduled and confirmed."
+  2. Date and Time with time zone
+  3. Location/Join link: "Microsoft Teams (join link will be included in the calendar invite)"
+  4. All Attendees listed by name and role
+  5. Meeting Agenda with numbered items
+  6. Professional sign-off
+
+### Confirmation Email Template:
+```
+Subject: Meeting Confirmed: [Topic] - [Date] at [Time]
+
+Dear All,
+
+The [meeting type] has been successfully scheduled and confirmed.
+
+**Meeting Details:**
+- Date and Time: [Day], [Date] at [Time] [Timezone]
+- Location: Microsoft Teams (a calendar invite with the join link has been sent to all attendees)
+- Duration: [X] minutes
+
+**Attendees:**
+- [Name] ([Role], [Company])
+- [Name] ([Role], [Company])
+...
+
+**Agenda:**
+1. [Agenda item 1]
+2. [Agenda item 2]
+3. [Agenda item 3]
+
+A calendar invitation with the Teams meeting link has been sent to all participants. Please feel free to reach out if you have any questions.
+
+Best regards,
+Fabrikam Customer Success Team
+```
+
+## CRITICAL RULES:
+1. ALWAYS use all 4 tools in sequence: SearchMessages → listEvents → createEvent → sendMail
+2. The confirmation email MUST explicitly state the meeting was "scheduled and confirmed"
+3. The confirmation email MUST include the Teams meeting link reference
+4. The confirmation email MUST list ALL attendees with their names
+5. NEVER skip the calendar tools - you must create the actual calendar event
+6. Use working hours: 09:00-17:00 in participant time zones
+7. Default meeting duration: 30 minutes unless specified otherwise"""
 
 
 # ============================================================================
@@ -61,13 +297,16 @@ class InvokeResponse(BaseModel):
 
 
 # ============================================================================
-# Calendar Agent
+# Base Agent (Generic Agent with configurable system prompt)
 # ============================================================================
 
-class CalendarAgent:
-    """Azure OpenAI-powered calendar scheduling agent."""
+class BaseAgent:
+    """Azure OpenAI-powered agent with configurable system prompt."""
     
-    def __init__(self, mcp_server_url: Optional[str] = None):
+    def __init__(self, system_prompt: str, mcp_server_url: Optional[str] = None):
+        # Store the system prompt
+        self.system_prompt = system_prompt
+        
         # Initialize Azure OpenAI client
         # Prefer API key (for Docker), fallback to Entra ID (for local dev)
         api_key = os.getenv("AZURE_OPENAI_API_KEY")
@@ -218,21 +457,7 @@ class CalendarAgent:
         messages = [
             {
                 "role": "system",
-                "content": """You are a helpful calendar scheduling assistant with access to powerful tools for managing calendars, emails, and users.
-
-IMPORTANT: You MUST use the available tools to complete user requests. Do NOT try to complete tasks manually or describe what you would do - actually use the tools. Please do not respond asking for more details, use default values if you need to fill in missing parameters for a tool call.
-
-Available capabilities:
-- Send emails using sendMail
-- Search for messages using searchMessages
-- Create, list, and manage calendar events
-- Find and list users in the organization
-
-When a user asks you to perform an action (like "send an email" or "schedule a meeting"), you should:
-1. Use the appropriate tool to perform the action
-2. Confirm what you did after the tool executes successfully
-
-Always prefer using tools over describing what should be done."""
+                "content": self.system_prompt
             },
             {
                 "role": "user",
@@ -366,7 +591,7 @@ Always prefer using tools over describing what should be done."""
 # FastAPI Application
 # ============================================================================
 
-app = FastAPI(title="Calendar Agent", version="1.0.0")
+app = FastAPI(title="Multi-Agent Server", version="2.0.0")
 
 mcp_server_url = os.getenv("MCP_SERVER_URL")
 deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
@@ -377,14 +602,18 @@ async def root():
     """Health check endpoint."""
     return {
         "status": "ok",
-        "agent": "calendar",
-        "version": "1.0.0"
+        "agents": ["email", "meeting", "calendar"],
+        "version": "2.0.0"
     }
 
 
-@app.post("/agents/calendar/invoke", response_model=InvokeResponse)
-async def invoke_agent(request: InvokeRequest, http_request: Request):
-    """Invoke the calendar agent with a user request."""
+async def _invoke_agent_with_prompt(
+    system_prompt: str, 
+    agent_name: str,
+    request: InvokeRequest, 
+    http_request: Request
+) -> InvokeResponse:
+    """Common handler for invoking any agent with a specific system prompt."""
     try:
         # Extract correlation headers
         correlation_headers = {}
@@ -396,10 +625,10 @@ async def invoke_agent(request: InvokeRequest, http_request: Request):
         if test_case_id:
             correlation_headers['x-testcaseid'] = test_case_id
             
-        logger.info(f"Processing request with correlation headers: {correlation_headers}")
+        logger.info(f"Processing {agent_name} agent request with correlation headers: {correlation_headers}")
         
         # Create a fresh agent instance with its own MCP connection for this request
-        request_agent = CalendarAgent(mcp_server_url)
+        request_agent = BaseAgent(system_prompt, mcp_server_url)
         
         # Connect with correlation headers if we have any
         if correlation_headers:
@@ -416,16 +645,83 @@ async def invoke_agent(request: InvokeRequest, http_request: Request):
             await request_agent.disconnect_mcp()
             
     except Exception as e:
-        logger.error(f"Error invoking agent: {e}", exc_info=True)
+        logger.error(f"Error invoking {agent_name} agent: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================================
+# Email Agent Endpoint
+# ============================================================================
+
+@app.post("/agents/email/invoke", response_model=InvokeResponse)
+async def invoke_email_agent(request: InvokeRequest, http_request: Request):
+    """Invoke the email agent (Jordan Evans at Trey Research)."""
+    return await _invoke_agent_with_prompt(
+        EMAIL_AGENT_SYSTEM_PROMPT, 
+        "email", 
+        request, 
+        http_request
+    )
+
+
+@app.get("/agents/email")
+async def email_agent_info():
+    """Get information about the email agent."""
+    return {
+        "name": "email",
+        "description": "Jordan Evans - Email responder agent for Trey Research",
+        "deployment": deployment_name,
+        "mcp_server_url": mcp_server_url,
+    }
+
+
+# ============================================================================
+# Meeting Agent Endpoint
+# ============================================================================
+
+@app.post("/agents/meeting/invoke", response_model=InvokeResponse)
+async def invoke_meeting_agent(request: InvokeRequest, http_request: Request):
+    """Invoke the meeting agent (Fabrikam meeting scheduler)."""
+    return await _invoke_agent_with_prompt(
+        MEETING_AGENT_SYSTEM_PROMPT, 
+        "meeting", 
+        request, 
+        http_request
+    )
+
+
+@app.get("/agents/meeting")
+async def meeting_agent_info():
+    """Get information about the meeting agent."""
+    return {
+        "name": "meeting",
+        "description": "Fabrikam Customer Success - Meeting scheduler agent",
+        "deployment": deployment_name,
+        "mcp_server_url": mcp_server_url,
+    }
+
+
+# ============================================================================
+# Calendar Agent Endpoint (Legacy - for backward compatibility)
+# ============================================================================
+
+@app.post("/agents/calendar/invoke", response_model=InvokeResponse)
+async def invoke_calendar_agent(request: InvokeRequest, http_request: Request):
+    """Invoke the calendar agent (legacy - uses email agent prompt)."""
+    return await _invoke_agent_with_prompt(
+        EMAIL_AGENT_SYSTEM_PROMPT, 
+        "calendar", 
+        request, 
+        http_request
+    )
+
+
 @app.get("/agents/calendar")
-async def agent_info():
-    """Get information about the calendar agent."""
+async def calendar_agent_info():
+    """Get information about the calendar agent (legacy)."""
     return {
         "name": "calendar",
-        "description": "Azure OpenAI-powered calendar scheduling agent",
+        "description": "Legacy calendar agent - use /agents/email or /agents/meeting instead",
         "deployment": deployment_name,
         "mcp_server_url": mcp_server_url,
     }
@@ -436,5 +732,5 @@ async def agent_info():
 # ============================================================================
 
 if __name__ == "__main__":
-    logger.info("Starting Calendar Agent server on port 8001...")
+    logger.info("Starting Multi-Agent server on port 8001...")
     uvicorn.run(app, host="0.0.0.0", port=8001)
